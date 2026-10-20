@@ -29,7 +29,7 @@
 #   -> 启用插件 -> rabbitmqadmin
 # (每个独立 RUN 调 yum 都会重新下载全部仓库元数据，故 yum 操作合并进 RUN#1)
 
-ARG RABBITMQ_VERSION=4.3.6
+ARG RABBITMQ_VERSION=4.3.7
 ARG OTP_VERSION=27.3.4.18
 ARG GOSU_VERSION=1.17
 ARG RABBITMQADMIN_VERSION=2.35.0
