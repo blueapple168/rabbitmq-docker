@@ -12,9 +12,12 @@
 #      必须先装包；缺 tar/gzip 会在解压 RabbitMQ 包时以 127 失败，报错点离真因很远。
 #   3. Kylin V11 的包名与 RHEL 不完全一致（shadow 而非 shadow-utils），
 #      这类包按候选名依次尝试，避免个别包名差异直接中断构建。
-#   4. Kylin V11 2503 官方参数: 内核 6.6 / glibc 2.38 / gcc 12.3，
-#      对应 erlang RPM 的 el9 分支（glibc >= 2.34）。构建期仍会探测 glibc 再决定，
-#      使同一份文件也能直接用于 glibc 2.28 的 Kylin V10；可用 ARG ERLANG_RPM_EL 强制指定。
+#   4. erlang RPM 的 el8/el9 分支由 **OpenSSL ABI** 决定，而不是 glibc:
+#      erlang-rpm 的 crypto.so 是动态链接系统 OpenSSL 的 —— el9 构建要求 OPENSSL_3.4.0
+#      符号，而 Kylin V11 2503 自带 OpenSSL 3.0.12（最高只有 OPENSSL_3.0.0），
+#      装 el9 会在 crypto:start() 处加载失败。因此这里安装 compat-openssl11-libs
+#      （提供 libcrypto.so.1.1 / libssl.so.1.1），并走 el8 分支（其 crypto 依赖 1.1.1 ABI）。
+#      若目标系统自带 OpenSSL >= 3.4，可用 --build-arg ERLANG_RPM_EL=el9 切回。
 #   5. Erlang/OTP 用 RabbitMQ 官方零依赖 erlang-rpm（自带 OpenSSL 运行时），不源码编译；
 #      RabbitMQ 本体用官方 generic-unix 标准工具链包（非 latest-toolchain）+ .asc PGP 校验。
 #   6. 官方 management 变体的功能合并进单镜像（启用 rabbitmq_management、保留 metrics
@@ -118,6 +121,9 @@ RUN set -euxo pipefail; \
     install_any hostname; \
     install_any gnupg2 gnupg; \
     install_any glibc-all-langpacks glibc-langpack-en; \
+    # erlang-rpm 的 el8 分支需要 OpenSSL 1.1.1 ABI（libcrypto.so.1.1 / libssl.so.1.1），
+    # Kylin V11 默认只带 OpenSSL 3.0，必须装这个兼容包，否则 crypto 无法加载
+    install_any compat-openssl11-libs; \
     for c in tar xz curl gpg ps hostname bash sed awk grep find useradd groupadd sha256sum install; do \
         command -v "$c" >/dev/null 2>&1 \
             || { echo "ERROR: 缺少命令 ${c}，请确认麒麟仓库源可用（base/updates）" >&2; exit 1; }; \
@@ -155,19 +161,15 @@ RUN set -euxo pipefail; \
         echo "ERROR: 下载重试 5 次仍失败: ${_u}" >&2; return 1; \
     }; \
     GLIBC_VER="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}' || true)"; \
-    if [ -z "$GLIBC_VER" ]; then \
-        GLIBC_VER="$(ldd --version 2>&1 | sed -n '1s/.* //p' || true)"; \
-    fi; \
     EL_TAG="${ERLANG_RPM_EL}"; \
     if [ "$EL_TAG" = 'auto' ]; then \
-        if [ -z "$GLIBC_VER" ]; then \
-            echo "ERROR: 无法探测 glibc 版本，请显式指定 --build-arg ERLANG_RPM_EL=el8|el9" >&2; exit 1; \
-        fi; \
-        GM="${GLIBC_VER%%.*}"; GN="${GLIBC_VER#*.}"; GN="${GN%%.*}"; \
-        if [ "${GM:-0}" -gt 2 ] || { [ "${GM:-0}" -eq 2 ] && [ "${GN:-0}" -ge 34 ]; }; then \
-            EL_TAG='el9'; \
-        else \
+        # crypto.so 动态链接系统 OpenSSL: el9 构建要 OPENSSL_3.4.0 符号（Kylin V11 只有 3.0.12，\
+        # 不够），el8 构建要 1.1.1 ABI（libcrypto.so.1.1，由 compat-openssl11-libs 提供）。\
+        # 按实际可用的 ABI 选分支，而不是按 glibc 版本。\
+        if [ -e /usr/lib64/libcrypto.so.1.1 ] || [ -e /lib64/libcrypto.so.1.1 ]; then \
             EL_TAG='el8'; \
+        else \
+            EL_TAG='el9'; \
         fi; \
     fi; \
     echo "==> glibc=${GLIBC_VER:-unknown} -> erlang RPM 分支 ${EL_TAG}"; \

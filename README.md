@@ -64,19 +64,22 @@ UOS Server 20 1070a 为 glibc 2.28（RHEL 8 ABI），固定使用 **el8** 资产
 
 | 目录 | RabbitMQ | Erlang/OTP | Erlang RPM 分支 | 基础镜像 tag | 产出 tag |
 |------|----------|-----------|-----------------|--------------|----------|
-| `4.0/kylin` | 4.0.9 | 27.3.4.19 | el9（glibc 2.38） | `v11-2503` | `4.0-kylin-management` / `4.0.9-kylin-management` |
-| `4.1/kylin` | 4.1.8 | 27.3.4.19 | el9 | `v11-2503` | `4.1-kylin-management` / `4.1.8-kylin-management` |
-| `4.2/kylin` | 4.2.9 | 27.3.4.19 | el9 | `v11-2503` | `4.2-kylin-management` / `4.2.9-kylin-management` |
-| `4.3/kylin` | 4.3.7 | 27.3.4.19 | el9 | `v11-2503` | `4.3-kylin-management` / `4.3.7-kylin-management` |
-| `4.4/kylin` | 4.4.0 | 29.1.2 | el9 | `v11-2503` | `4.4-kylin-management` / `4.4.0-kylin-management` |
+| `4.0/kylin` | 4.0.9 | 27.3.4.19 | el8 + compat-openssl11 | `v11-2503` | `4.0-kylin-management` / `4.0.9-kylin-management` |
+| `4.1/kylin` | 4.1.8 | 27.3.4.19 | el8 + compat-openssl11 | `v11-2503` | `4.1-kylin-management` / `4.1.8-kylin-management` |
+| `4.2/kylin` | 4.2.9 | 27.3.4.19 | el8 + compat-openssl11 | `v11-2503` | `4.2-kylin-management` / `4.2.9-kylin-management` |
+| `4.3/kylin` | 4.3.7 | 27.3.4.19 | el8 + compat-openssl11 | `v11-2503` | `4.3-kylin-management` / `4.3.7-kylin-management` |
+| `4.4/kylin` | 4.4.0 | 29.1.2 | el8 + compat-openssl11 | `v11-2503` | `4.4-kylin-management` / `4.4.0-kylin-management` |
 
-Kylin V11 2503 官方参数：内核 6.6 / **glibc 2.38** / gcc 12.3，因此走 **el9** 分支。
-Dockerfile 在构建期会探测 glibc 再决定 el8/el9，同一份文件也可直接用于 glibc 2.28 的 Kylin V10
-（或用 `--build-arg ERLANG_RPM_EL=el8` 强制）。
+**分支选择的依据是 OpenSSL ABI，不是 glibc**：erlang-rpm 的 `crypto.so` 动态链接系统 OpenSSL，
+el9 构建要求 `OPENSSL_3.4.0` 符号，而 Kylin V11 2503 自带 OpenSSL **3.0.12**（最高只有
+`OPENSSL_3.0.0`），装 el9 会在 `crypto:start()` 处加载失败。因此 Kylin 变体安装
+`compat-openssl11-libs`（提供 `libcrypto.so.1.1` / `libssl.so.1.1`）并走 **el8** 分支。
+Dockerfile 构建期按 `libcrypto.so.1.1` 是否存在自动判定，也可用 `--build-arg ERLANG_RPM_EL=el9` 强制
+（目标系统自带 OpenSSL ≥ 3.4 时）。
 
 ### 2.3 通用说明
 
-- Erlang 一律取 RabbitMQ 官方 `rabbitmq/erlang-rpm` 的**零依赖 RPM**（自带 OpenSSL 运行时），不源码编译。
+- Erlang 一律取 RabbitMQ 官方 `rabbitmq/erlang-rpm` 的 RPM，不源码编译；注意其 `crypto.so` **动态链接系统 OpenSSL**（el8 需 1.1.1 ABI，el9 需 OPENSSL_3.4.0）。
 - RabbitMQ 本体取官方 **`rabbitmq-server-generic-unix-<版本>.tar.xz`**（标准工具链版，**不是**
   `latest-toolchain` 版）——标准版面向较老 glibc 构建，与 erlang-rpm 的 OTP 是官方推荐组合。
 - 4.4 使用 OTP 29，官方 Ubuntu 基线已切到 26.04；该版本在两个国产平台上的运行验证请以实际测试为准。
@@ -89,9 +92,9 @@ Dockerfile 在构建期会探测 glibc 再决定 el8/el9，同一份文件也可
 |------|----------|------------|
 | 基础镜像 | `ghcr.io/blueapple168/uos-server-20-1070a:latest` | `cr.kylinos.cn/kylin/kylin-server-minimal:v11-2503` |
 | 包管理器 | yum（dnf） | **dnf5**（无 yum / microdnf），按 dnf5→dnf→microdnf→yum 探测 |
-| glibc | 2.28 → el8 资产 | 2.38 → el9 资产（构建期探测，可强制） |
+| OpenSSL / el 分支 | 1.1.1（glibc 2.28）→ el8 资产 | 3.0.12 → 需 `compat-openssl11-libs` 走 el8 资产 |
 | 包名差异 | `glibc-langpack-zh` 等 | `shadow`（非 shadow-utils）、`glibc-all-langpacks` 等，按候选名依次尝试 |
-| Erlang | 官方 erlang-rpm（el8） | 官方 erlang-rpm（el8/el9 自动） |
+| Erlang | 官方 erlang-rpm（el8） | 官方 erlang-rpm（按 OpenSSL ABI 选 el8/el9） |
 | 插件 | `rabbitmq_management` + `rabbitmq_prometheus` | 同左 |
 | 命令行 | `rabbitmqadmin` 2.35.0（musl 静态版） | 同左 |
 | 降权运行 | `gosu` 1.17 + `rabbitmq` 用户（UID 999 被占用时自动回退） | 同左 |
@@ -196,7 +199,7 @@ docker build --build-arg ERLANG_RPM_EL=el8 -t rabbitmq:4.3-kylin-management 4.3/
 | `GOSU_VERSION` / `RABBITMQADMIN_VERSION` | `1.17` / `2.35.0` | 两个 GitHub 静态二进制版本 |
 | `BASE_IMAGE_TAG` | UOS：`uos-server-20-1070a:latest`<br>Kylin：`v11-2503` | 基础镜像 tag |
 | `BASE_IMAGE_REPO` | 仅 Kylin：`cr.kylinos.cn/kylin/kylin-server-minimal` | 基础镜像仓库 |
-| `ERLANG_RPM_EL` | 仅 Kylin：`auto` | `auto` 按 glibc 判定 el8/el9，可强制 `el8`/`el9` |
+| `ERLANG_RPM_EL` | 仅 Kylin：`auto` | `auto` 按 `libcrypto.so.1.1` 是否存在判定，可强制 `el8`/`el9` |
 
 > 所有 GitHub 下载都走同一个 `fetch()` 重试函数（5 次 + 退避 + HTML 错误页识别），
 > 失败时会打印具体的 URL 与尝试次数，便于区分「网络抖动」与「版本号写错」。
@@ -310,7 +313,7 @@ curl -s "https://api.github.com/repos/rabbitmq/erlang-rpm/releases/tags/v27.3.4.
 | **RUN 续行里不能有空行** | Docker 会报 `Empty continuation line`。整行 `#` 注释在续行中是合法的（解析器会剥离），但空行不行。 |
 | 单个 RUN 内合并包管理器操作 | 每次 `yum`/`dnf5` 调用都会重下全部仓库元数据，拆成多个 RUN 会显著拉长构建时间 |
 | 用 `install <本地rpm>` 而非 `localinstall` | dnf5 没有 `localinstall`；本地 rpm 用 `install /path/x.rpm`，失败时回退 `rpm -ivh` |
-| erlang RPM 的 el 分支必须匹配 glibc | el9 要求 glibc ≥ 2.34。Kylin V11 = 2.38（el9）、Kylin V10 / UOS 20 = 2.28（el8），选错会在冒烟测试阶段报 crypto 启动失败 |
+| **erlang RPM 的 el 分支必须匹配 OpenSSL ABI** | `crypto.so` 动态链接系统 OpenSSL：el9 构建要 `OPENSSL_3.4.0` 符号（Kylin V11 只有 3.0.12，**不够**），el8 构建要 `libcrypto.so.1.1`。选错会在冒烟测试阶段以 `crypto start ERROR` 失败。Kylin V11 需要装 `compat-openssl11-libs` 并走 el8 |
 | minimal 层缺 `tar`/`xz`/`bash` | 缺 `tar`/`xz` 会在解压 RabbitMQ 包时以 127 失败；`docker-entrypoint.sh` 是 bash 脚本，必须装 `bash` |
 | 包名因发行版而异 | UOS：`glibc-langpack-zh`；Kylin：`shadow`（非 shadow-utils）、`glibc-all-langpacks`。这类包按候选名依次尝试 |
 | dnf5 缓存目录 | 是 `/var/cache/libdnf5`，不是 `/var/cache/dnf` |
