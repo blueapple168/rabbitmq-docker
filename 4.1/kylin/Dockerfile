@@ -83,15 +83,58 @@ ENV TZ=Asia/Shanghai
 ENV LANG=C.UTF-8 LANGUAGE=C.UTF-8 LC_ALL=C.UTF-8
 
 ############################################
-# RUN#1 单次包管理器会话: 装依赖 -> 装 erlang RPM -> gosu -> 清理
-# 每个独立 RUN 调 dnf5 都会重下仓库元数据，拆开会显著拉长构建时间
+# RUN#1 装运行时依赖（包管理器相关操作全部合并在这一个 RUN）
+# 每次 dnf5 调用都会重下仓库元数据，拆开会显著拉长构建时间，所以装包只做一次。
+# 注意: 这里不清缓存，后续 RUN 装 erlang RPM 时还要复用元数据。
 ############################################
 
 RUN set -euxo pipefail; \
-    # ---- 0. 架构判别（erlang RPM 用 x86_64/aarch64，gosu 用 amd64/arm64）----
+    PKG_MGR=""; \
+    for m in dnf5 dnf microdnf yum; do \
+        if command -v "$m" >/dev/null 2>&1; then PKG_MGR="$(command -v "$m")"; break; fi; \
+        for d in /usr/bin /bin /usr/sbin /sbin; do \
+            if [ -x "${d}/${m}" ]; then PKG_MGR="${d}/${m}"; break 2; fi; \
+        done; \
+    done; \
+    if [ -z "$PKG_MGR" ]; then \
+        echo "ERROR: 未找到可用的包管理器 (dnf5/dnf/microdnf/yum)" >&2; exit 1; \
+    fi; \
+    echo "==> 使用包管理器: ${PKG_MGR}"; \
+    install_any() { \
+        for p in "$@"; do \
+            if "$PKG_MGR" install -y --setopt=install_weak_deps=False "$p" >/dev/null 2>&1; then \
+                echo "  installed: $p"; return 0; \
+            fi; \
+        done; \
+        echo "  WARN: 候选包均未安装成功: $*" >&2; return 0; \
+    }; \
+    HARD_PKGS="tar gzip xz curl ca-certificates sed gawk grep findutils coreutils bash"; \
+    if ! "$PKG_MGR" install -y --setopt=install_weak_deps=False $HARD_PKGS; then \
+        echo "WARN: 批量安装失败，改为逐包安装以定位缺包" >&2; \
+        for _p in $HARD_PKGS; do install_any "$_p"; done; \
+    fi; \
+    install_any shadow shadow-utils; \
+    install_any procps-ng procps; \
+    install_any hostname; \
+    install_any gnupg2 gnupg; \
+    install_any glibc-all-langpacks glibc-langpack-en; \
+    for c in tar xz curl gpg ps hostname bash sed awk grep find useradd groupadd sha256sum install; do \
+        command -v "$c" >/dev/null 2>&1 \
+            || { echo "ERROR: 缺少命令 ${c}，请确认麒麟仓库源可用（base/updates）" >&2; exit 1; }; \
+    done
+
+############################################
+# RUN#2 erlang RPM: 判定 el 分支 -> 下载 -> SHA256 -> 安装 -> 冒烟测试
+# 与 RUN#1 分开是为了失败时可定位: RUN 命令过长时 GitHub 注解会在 4KB 处截断，
+# 恰好把 "exit code: N" 截掉；拆短之后退出码能直接看到。
+# 安装本地 rpm 不再传 --nogpgcheck —— dnf5 只认 --no-gpgchecks，
+# 传旧参数会被拒绝并退化成 rpm -ivh，从而丢掉依赖解析能力。
+############################################
+
+RUN set -euxo pipefail; \
     case "${TARGETARCH:-amd64}" in \
-        amd64) rpmArch='x86_64';  gosuArch='amd64' ;; \
-        arm64) rpmArch='aarch64'; gosuArch='arm64' ;; \
+        amd64) rpmArch='x86_64' ;; \
+        arm64) rpmArch='aarch64' ;; \
         *) echo "ERROR: unsupported TARGETARCH=${TARGETARCH} (erlang-rpm 仅提供 x86_64/aarch64)" >&2; exit 1 ;; \
     esac; \
     GH="${MIRROR_GITHUB:-https://github.com}"; \
@@ -111,54 +154,6 @@ RUN set -euxo pipefail; \
         done; \
         echo "ERROR: 下载重试 5 次仍失败: ${_u}" >&2; return 1; \
     }; \
-    echo "==> TARGETARCH=${TARGETARCH:-amd64}  rpmArch=${rpmArch}"; \
-    \
-    # ---- 1. 包管理器探测 ----
-    PKG_MGR=""; \
-    for m in dnf5 dnf microdnf yum; do \
-        if command -v "$m" >/dev/null 2>&1; then PKG_MGR="$(command -v "$m")"; break; fi; \
-        for d in /usr/bin /bin /usr/sbin /sbin; do \
-            if [ -x "${d}/${m}" ]; then PKG_MGR="${d}/${m}"; break 2; fi; \
-        done; \
-    done; \
-    if [ -z "$PKG_MGR" ]; then \
-        echo "ERROR: 未找到可用的包管理器 (dnf5/dnf/microdnf/yum)" >&2; exit 1; \
-    fi; \
-    echo "==> 使用包管理器: ${PKG_MGR}"; \
-    \
-    # ---- 2. 安装运行时依赖 ----
-    # 包名在麒麟仓库里可能与 RHEL 不同，先定义「按候选名依次尝试」的通用安装函数；
-    # 全部失败只告警，由后面的「命令自检」兜底判定是否真的缺能力
-    install_any() { \
-        for p in "$@"; do \
-            if "$PKG_MGR" install -y --setopt=install_weak_deps=False "$p" >/dev/null 2>&1; then \
-                echo "  installed: $p"; return 0; \
-            fi; \
-        done; \
-        echo "  WARN: 候选包均未安装成功: $*" >&2; return 0; \
-    }; \
-    \
-    # 硬依赖：先一次装齐（快）；失败则逐包装，便于定位到底是哪个包名在麒麟仓库里不存在。
-    # 缺 tar/gzip/xz 会在解压 RabbitMQ 包时以 127 失败，缺 bash 会让 entrypoint 起不来，
-    # 报错点离真因都很远，所以这里宁可多装一轮也要把原因说清楚。
-    HARD_PKGS="tar gzip xz curl ca-certificates sed gawk grep findutils coreutils bash"; \
-    if ! "$PKG_MGR" install -y --setopt=install_weak_deps=False $HARD_PKGS; then \
-        echo "WARN: 批量安装失败，改为逐包安装以定位缺包" >&2; \
-        for _p in $HARD_PKGS; do install_any "$_p"; done; \
-    fi; \
-    install_any shadow shadow-utils; \
-    install_any procps-ng procps; \
-    install_any hostname; \
-    install_any gnupg2 gnupg; \
-    install_any glibc-all-langpacks glibc-langpack-en; \
-    \
-    # ---- 3. 命令自检（把缺包的报错点前移）----
-    for c in tar xz curl gpg ps hostname bash sed awk grep find useradd groupadd sha256sum install; do \
-        command -v "$c" >/dev/null 2>&1 \
-            || { echo "ERROR: 缺少命令 ${c}，请确认麒麟仓库源可用（base/updates）" >&2; exit 1; }; \
-    done; \
-    \
-    # ---- 4. 判定 erlang RPM 的 el 分支 ----
     GLIBC_VER="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}' || true)"; \
     if [ -z "$GLIBC_VER" ]; then \
         GLIBC_VER="$(ldd --version 2>&1 | sed -n '1s/.* //p' || true)"; \
@@ -183,43 +178,62 @@ RUN set -euxo pipefail; \
         el9:aarch64) rpmSha="${ERLANG_RPM_SHA256_EL9_AARCH64}" ;; \
         *) echo "ERROR: 不支持的组合 ${EL_TAG}:${rpmArch}" >&2; exit 1 ;; \
     esac; \
-    \
-    # ---- 5. 下载 erlang RPM 并按官方 digest 做 SHA256 校验 ----
     ERLANG_RPM="erlang-${OTP_VERSION}-1.${EL_TAG}.${rpmArch}.rpm"; \
     ERLANG_RPM_URL="${GH}/rabbitmq/erlang-rpm/releases/download/v${OTP_VERSION}/${ERLANG_RPM}"; \
     echo "Downloading: ${ERLANG_RPM_URL}"; \
     fetch "$ERLANG_RPM_URL" "/tmp/${ERLANG_RPM}"; \
     echo "${rpmSha}  /tmp/${ERLANG_RPM}" | sha256sum --check --strict -; \
-    \
-    # erlang-rpm 为零依赖包；dnf5 对本地 rpm 的安装参数在不同小版本上略有差异，
-    # 失败时用 rpm -ivh 兜底（无依赖可解析，所以安全）
-    "$PKG_MGR" install -y --nogpgcheck --setopt=install_weak_deps=False "/tmp/${ERLANG_RPM}" \
+    PKG_MGR="$(command -v dnf5 || command -v dnf || command -v microdnf || command -v yum || true)"; \
+    if [ -z "$PKG_MGR" ]; then echo "ERROR: 未找到包管理器" >&2; exit 1; fi; \
+    "$PKG_MGR" install -y --setopt=install_weak_deps=False "/tmp/${ERLANG_RPM}" \
         || rpm -ivh --replacepkgs "/tmp/${ERLANG_RPM}"; \
     rm -f "/tmp/${ERLANG_RPM}"; \
-    \
-    # ---- 6. 冒烟测试: crypto 依赖 OpenSSL 运行时，能起来说明 RPM 与 glibc/架构匹配 ----
     command -v erl; \
-    erl -noshell -eval 'case crypto:start() of ok -> io:format("crypto started ok~n"); {error,E} -> io:format("crypto start ERROR ~p~n",[E]), halt(1) end, init:stop().'; \
-    \
-    # ---- 7. gosu: 麒麟源无此包，从 GitHub 下载静态二进制并按 SHA256SUMS 校验 ----
-    mkdir -p /usr/local/bin /tmp/chk; \
+    erl -noshell -eval 'case crypto:start() of ok -> io:format("crypto started ok~n"); {error,E} -> io:format("crypto start ERROR ~p~n",[E]), halt(1) end, init:stop().'
+
+############################################
+# RUN#3 gosu（GitHub 静态二进制 + SHA256SUMS 校验）与最终清理
+############################################
+
+RUN set -euxo pipefail; \
+    case "$(uname -m)" in \
+        x86_64)  gosuArch='amd64' ;; \
+        aarch64) gosuArch='arm64' ;; \
+        *) echo "ERROR: unsupported arch: '$(uname -m)'" >&2; exit 1 ;; \
+    esac; \
+    GH="${MIRROR_GITHUB:-https://github.com}"; \
+    : "=== 下载重试函数: 5 次 + 退避 + HTML 错误页识别 (GitHub 高并发下载易被限流/连接重置) ===" ; \
+    fetch() { \
+        _u="$1"; _o="$2"; _n=0; \
+        while [ "$_n" -lt 5 ]; do \
+            if curl -fsSL --connect-timeout 20 --retry 2 --retry-delay 5 -o "$_o" "$_u"; then \
+                head -c 1024 "$_o" > /tmp/.fetch.probe 2>/dev/null || true; \
+                if grep -qi -m1 -e '<!doctype' -e '<html' /tmp/.fetch.probe 2>/dev/null; then \
+                    echo "WARN: ${_u} 返回 HTML 错误页，重试" >&2; rm -f "$_o" /tmp/.fetch.probe; \
+                else \
+                    rm -f /tmp/.fetch.probe; return 0; \
+                fi; \
+            fi; \
+            _n=$((_n + 1)); echo "WARN: 下载失败 (第 ${_n}/5 次): ${_u}" >&2; sleep $((_n * 5)); \
+        done; \
+        echo "ERROR: 下载重试 5 次仍失败: ${_u}" >&2; return 1; \
+    }; \
     GOSU_BASE="${GH}/tianon/gosu/releases/download/${GOSU_VERSION}"; \
+    mkdir -p /usr/local/bin /tmp/chk; \
     fetch "${GOSU_BASE}/SHA256SUMS" /tmp/chk/gosu.sums; \
     fetch "${GOSU_BASE}/gosu-${gosuArch}" "/tmp/chk/gosu-${gosuArch}"; \
     cd /tmp/chk; \
-    grep " \*\?gosu-${gosuArch}\$" gosu.sums | sha256sum -c -; \
-    install -m 0755 "/tmp/chk/gosu-${gosuArch}" /usr/local/bin/gosu; \
+    grep " \*\?gosu-${gosuArch}\$" gosu.sums > gosu.one; \
+    test -s gosu.one; \
+    sha256sum -c gosu.one; \
+    install -m 0755 "gosu-${gosuArch}" /usr/local/bin/gosu; \
     cd /; rm -rf /tmp/chk; \
     gosu nobody true; \
-    \
-    # ---- 8. 清理构建垃圾（dnf5 的缓存目录是 libdnf5，不是 dnf/yum）----
-    "$PKG_MGR" clean all || true; \
     rm -rf /var/cache/dnf/* \
            /var/cache/libdnf5/* \
            /var/cache/yum/* \
            /var/cache/microdnf/* \
-           /var/tmp/* \
-           /tmp/*
+           /var/tmp/*
 
 ############################################
 # 创建 rabbitmq 系统用户/组、目录结构
