@@ -2,25 +2,31 @@
 # check=skip=SecretsUsedInArgOrEnv
 #
 # 参考官方镜像: https://github.com/docker-library/rabbitmq (4.3/ubuntu/Dockerfile)
-# 官方基于 ubuntu:24.04 源码编译 OpenSSL + Erlang/OTP，本文件适配 UOS Server 20 1070a (yum/dnf)
+# 官方基于较新的 Ubuntu 源码编译 OpenSSL + Erlang/OTP，本文件适配 UOS Server 20 1070a (yum/dnf)
+#
+# 本目录是仓库 UOS 变体族 (4.0 / 4.1 / 4.2 / 4.3 / 4.4) 中的一个:
+#   五个版本共用同一套构建逻辑与同一个 UOS 基础镜像 (uos-server-20-1070a)，
+#   差异仅在 RABBITMQ_VERSION / OTP_VERSION / erlang RPM 的两个 SHA256 摘要。
+#   具体版本号见下方 ARG 区 —— 升级时只改 ARG，注释无需同步；
+#   完整版本矩阵见仓库根目录 README.md。
 #
 # 与官方的主要差异:
 #   1. 放弃源码编译 OpenSSL + Erlang/OTP（UOS 20 gcc/perl/autotools 较老，编译阶段报错多）
 #      改用 RabbitMQ 官方团队维护的零依赖 Erlang RPM 仓库:
 #      https://github.com/rabbitmq/erlang-rpm  (https://www.rabbitmq.com/docs/install-rpm#downloads)
-#      erlang-27.3.4.18-1.el8.<arch>.rpm 自带 OpenSSL 运行时，RHEL8/UOS Server 20 (glibc 2.28) 兼容
+#      erlang-<OTP_VERSION>-1.el8.<arch>.rpm 自带 OpenSSL 运行时，RHEL8/UOS Server 20 (glibc 2.28) 兼容
 #   2. RabbitMQ 本体使用官方通用二进制包 (标准工具链版，非 latest-toolchain):
-#      https://github.com/rabbitmq/rabbitmq-server/releases/download/v4.3.6/rabbitmq-server-generic-unix-4.3.6.tar.xz
+#      https://github.com/rabbitmq/rabbitmq-server/releases/download/v<RABBITMQ_VERSION>/rabbitmq-server-generic-unix-<RABBITMQ_VERSION>.tar.xz
 #      解压到 /opt/rabbitmq，布局与官方 Docker 镜像一致，entrypoint/conf.d 零改动
 #   3. gosu 不在 UOS 源中，改为从 GitHub releases 下载静态二进制
-#   4. 下载产物完整性校验 (双重)：
+#   4. 下载产物完整性校验 (双重):
 #      a) RabbitMQ tar.xz 通过官方 .asc PGP 签名校验 (gpg keyserver: hkps://keys.openpgp.org，
 #         与官方 alpine/ubuntu Dockerfile 一致)
 #      b) Erlang RPM 通过官方 SHA256 摘要校验 —— rabbitmq/erlang-rpm release 不提供 .asc
-#         签名文件 (34 个资产均为 .rpm)，官方校验手段是 release 元数据中的 digest，
-#         摘要取自 https://api.github.com/repos/rabbitmq/erlang-rpm/releases/tags/v27.3.4.18
-#   5. 官方 management 变体 (4.3/ubuntu/management) 的功能合并进来:
-#      启用 rabbitmq_management 插件、恢复 metrics collector、安装 rabbitmqadmin
+#         签名文件 (资产均为 .rpm)，官方校验手段是 release 元数据中的 digest，
+#         摘要取自 https://api.github.com/repos/rabbitmq/erlang-rpm/releases/tags/v<OTP_VERSION>
+#   5. 官方 management 变体 (4.3/ubuntu/management) 的功能合并进来，单镜像即带管理控制台:
+#      启用 rabbitmq_management 插件、保留 metrics collector、安装 rabbitmqadmin
 #
 # 构建流程 (单阶段):
 #   RUN#1 单次 yum 会话: yum 调优 + 运行时依赖(含 gnupg2) + erlang RPM (SHA256 校验) + 冒烟测试 + 清理
@@ -28,17 +34,20 @@
 #   -> 解压 rabbitmq-server-generic-unix tar.xz (.asc PGP 签名校验 + 冒烟测试)
 #   -> 启用插件 -> rabbitmqadmin
 # (每个独立 RUN 调 yum 都会重新下载全部仓库元数据，故 yum 操作合并进 RUN#1)
+#
+# 构建: docker build -t rabbitmq:4.3-management .
+# 全量: 在仓库根目录执行 ./build-uos.sh
 
 ARG RABBITMQ_VERSION=4.3.7
-ARG OTP_VERSION=27.3.4.18
+ARG OTP_VERSION=27.3.4.19
 ARG GOSU_VERSION=1.17
 ARG RABBITMQADMIN_VERSION=2.35.0
 ARG BASE_IMAGE_TAG=uos-server-20-1070a:latest
 
 # erlang-rpm release 无 .asc 签名文件，使用官方 digest (GitHub API) 做 SHA256 校验
 # 升级 OTP_VERSION 时需同步更新以下两个摘要
-ARG ERLANG_RPM_SHA256_X86_64=54241d7f5402bb51d0b6a1cb04d1de3b3bfa1b7d80fe26eafcdbb479716384b2
-ARG ERLANG_RPM_SHA256_AARCH64=0fa47849155d6ea8697013ea787b24a488c3748a53d4645b769dfc51916a1ea9
+ARG ERLANG_RPM_SHA256_X86_64=d61548b5df3c60bf85e94be9677478e7154210787376801d5f4cedf05d2e0c05
+ARG ERLANG_RPM_SHA256_AARCH64=462ea060f25566d9c1f4b368806056af88f05fb5bb51e924251ea4e7a79d72e4
 
 ############################################
 # runtime: 最终运行镜像（单阶段）
@@ -56,6 +65,7 @@ ARG ERLANG_RPM_SHA256_AARCH64
 LABEL maintainer="blueapple" \
         version="1.0" \
         description="RabbitMQ ${RABBITMQ_VERSION} (management) with Erlang/OTP ${OTP_VERSION} on UOS 1070a" \
+        org.opencontainers.image.source="https://github.com/blueapple168/rabbitmq" \
         org.opencontainers.image.base.name="registry.uniontech.com/uos-server-base/uos-server-20-1070a:latest" \
         org.opencontainers.image.title="RabbitMQ" \
         org.opencontainers.image.version="${RABBITMQ_VERSION}"
@@ -229,8 +239,11 @@ RUN set -eux; \
     gosu rabbitmq rabbitmq-plugins enable --offline rabbitmq_management
 
 # 说明: 官方基础镜像默认通过 conf.d/20-management_agent.disable_metrics_collector.conf
-# 禁用 metrics collector 以启用 Prometheus 风格指标; 但管理 UI 依赖 metrics collector,
-# 因此本镜像不再放置该配置文件 (官方 management 变体是 build 后再 rm，单镜像直接省去)
+# 禁用 metrics collector 以启用 Prometheus 风格指标; 但管理 UI 的统计/图表依赖 metrics collector,
+# 官方 management 变体是在 build 后 rm 掉该文件。本镜像合并了 management 功能，
+# 因此直接不 COPY 该文件 (等价于官方 management 变体的 rm)。
+# 目录中保留 20-management_agent.disable_metrics_collector.conf 仅为与 alpine/ubuntu 变体布局对齐，
+# 本 Dockerfile 不引用它 —— 若重新 COPY 会导致管理界面统计功能失效。
 
 # rabbitmqadmin (rabbitmqadmin-ng): 官方 CLI 管理工具，按架构从 GitHub 下载静态二进制
 # 注意: 使用 musl 静态版而非 gnu 版 —— gnu 版需要 GLIBC 2.34+，UOS 20 (el8, glibc 2.28) 无法运行;
@@ -259,7 +272,7 @@ VOLUME $RABBITMQ_DATA_DIR
 # 设为 true 使 beam.smp 成为容器中的 PID 1（信号传递正确）
 ENV RUNNING_UNDER_SYSTEMD=true
 
-COPY --chown=rabbitmq:rabbitmq 10-defaults.conf 20-management_agent.disable_metrics_collector.conf /etc/rabbitmq/conf.d/
+COPY --chown=rabbitmq:rabbitmq 10-defaults.conf /etc/rabbitmq/conf.d/
 COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/
 
 ENTRYPOINT ["docker-entrypoint.sh"]

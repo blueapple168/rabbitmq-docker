@@ -36,7 +36,9 @@ for version; do
 	export version
 
 	if [ -d "$version" ]; then
-		rm -rf "$version"
+		# 只清理由模板生成的 alpine/ubuntu 变体；
+		# UOS 变体为手工维护（不走模板），必须保留，否则 ./update.sh 会把 <版本>/UOS 一并删掉
+		rm -rf "$version/alpine" "$version/ubuntu"
 	fi
 
 	if jq -e '.[env.version] | not' versions.json > /dev/null; then

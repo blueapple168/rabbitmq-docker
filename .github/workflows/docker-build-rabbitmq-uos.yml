@@ -1,30 +1,33 @@
-name: RabbitMQ UOS 镜像构建
-# 适用仓库结构: <版本>/UOS/{Dockerfile, docker-entrypoint.sh, conf.d/...}
-# 例如: https://github.com/blueapple168/rabbitmq/tree/master/4.3/UOS
+name: RabbitMQ 镜像构建 (UOS / kylin)
+# 适用仓库结构: <版本>/<变体>/Dockerfile
+#   变体 = UOS   -> 基础镜像 UOS Server 20 1070a，产物 tag: <版本目录>-management
+#   变体 = kylin -> 基础镜像 Kylin Server V11 Minimal，产物 tag: <版本目录>-kylin-management
+#   （alpine / ubuntu 为上游模板生成，不参与本 workflow）
 #
 # 功能:
-#   1. detect    : 自动检测本次提交涉及的 */UOS 变体版本目录 (如 4.3)
+#   1. detect    : 自动检测本次提交涉及的 <版本>/<变体> 目录 (如 4.3/UOS、4.4/kylin)
 #   2. build-push: push 到 master 或手动触发时，推送镜像到 ghcr.io
 #   3. 上游监听  : 定时 (schedule) 或手动 (check_upstream=true) 检查
 #      https://github.com/rabbitmq/rabbitmq-server/releases 官方发布的最新
 #      <版本目录>.x 正式版本 (排除 draft/prerelease/rc)，发现新版本时:
-#        a) 自动更新 <版本>/UOS/Dockerfile 中的 ARG RABBITMQ_VERSION 并提交回 master
+#        a) 自动更新每个变体 <版本>/<变体>/Dockerfile 中的 ARG RABBITMQ_VERSION 并提交回 master
 #        b) 同一次 run 内立即用新版本号构建镜像 (tar.xz 的 .asc PGP 签名校验
 #           随版本号自动适配，无需人工介入)
 #
-# 产物 tag 以版本目录名为准并带 -management 后缀 (镜像自带管理控制台插件):
-#   ghcr.io/blueapple168/rabbitmq:4.3-management
-#   ghcr.io/blueapple168/rabbitmq:4.3.6-management (完整版本号，随上游自动更新)
+# 变体列表由目录结构自动推导（<版本>/<目录>/Dockerfile，排除 alpine/ubuntu），
+# 新增变体目录后无需修改本文件。
 on:
   push:
     branches: [master]
     paths:
-      - "**/UOS/**"
+      - "*/UOS/**"
+      - "*/kylin/**"
       - ".github/workflows/docker-build-rabbitmq-uos.yml"
   pull_request:
     branches: [master]
     paths:
-      - "**/UOS/**"
+      - "*/UOS/**"
+      - "*/kylin/**"
       - ".github/workflows/docker-build-rabbitmq-uos.yml"
   schedule:
     # 每日 UTC 02:00 (北京时间 10:00) 检查上游 rabbitmq-server 最新正式版
@@ -32,7 +35,11 @@ on:
   workflow_dispatch:
     inputs:
       version_dir:
-        description: "要构建的版本目录名 (如 4.3; 留空则构建仓库中所有 */UOS 变体)"
+        description: "要构建的版本目录名 (如 4.3; 留空则构建全部)"
+        required: false
+        default: ""
+      variant:
+        description: "要构建的变体 (UOS / kylin; 留空则构建全部变体)"
         required: false
         default: ""
       check_upstream:
@@ -43,10 +50,10 @@ on:
 env:
   REGISTRY: ghcr.io
   # 构建平台; 如需 arm64 改为 "linux/amd64,linux/arm64"
-  # (前提: GHCR 上已推送对应架构的 UOS 基础镜像 uos-server-20-1070a)
+  # (前提: 对应基础镜像已推送 arm64 架构: UOS 的 uos-server-20-1070a / Kylin 的 kylin-server-minimal)
   PLATFORMS: linux/amd64
 concurrency:
-  group: rabbitmq-uos-${{ github.ref }}
+  group: rabbitmq-images-${{ github.ref }}
   cancel-in-progress: true
 # GITHUB_TOKEN 默认只读; detect 需写权限提交版本升级 commit，
 # build-push 需 packages:write 推送镜像
@@ -55,10 +62,10 @@ permissions:
 jobs:
   ############################################
   # 检测待构建版本 (两种模式):
-  #   diff     : push/pull_request/手动 - 由本次提交涉及的文件变更决定 (原有逻辑)
+  #   diff     : push/pull_request/手动 - 由本次提交涉及的文件变更决定
   #   upstream : schedule/手动(check_upstream) - 由上游官方最新正式版决定，
-  #              有新版本时同步更新 Dockerfile 并提交回 master
-  # 输出 matrix: [{version: "4.3", rabbitmq_version: "4.3.6"}]
+  #              有新版本时同步更新各变体 Dockerfile 并提交回 master
+  # 输出 matrix: [{version: "4.3", variant: "UOS", rabbitmq_version: "4.3.7"}, ...]
   # 无待构建项时输出 []
   ############################################
   detect:
@@ -88,29 +95,36 @@ jobs:
               ;;
           esac
           echo "mode=${mode}" >> "$GITHUB_STEP_SUMMARY" || true
+
+          # 变体列表: 由目录结构推导 <版本>/<变体>/Dockerfile，排除上游模板生成的 alpine/ubuntu
+          variants="$(find . -mindepth 3 -maxdepth 3 -name Dockerfile -path './*/*/Dockerfile' \
+            | awk -F/ '{print $3}' | sort -u | grep -Ev '^(alpine|ubuntu)$' || true)"
+          if [ -z "$variants" ]; then
+            echo "::error::未找到任何变体目录 (<版本>/<变体>/Dockerfile)"
+            echo "matrix=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "变体: $(echo $variants)"
+
           matrix_entries_arr=()
           should_commit="no"
           if [ "$mode" = "upstream" ]; then
             ########################################
-            # 上游监听模式: 重写 - 修复版本正则、语义化版本排序缺陷
+            # 上游监听模式
             # 仅取与版本目录 (如 4.3) 匹配的正式版 tag: v4.3.N
             # 排除 draft / prerelease (rc/alpha/beta 均为 prerelease)
             ########################################
-            # 一次性拉取release列表，增加重试，使用分页page=1&per_page=100
             RELEASES=$(curl --max-time 30 --retry 3 -fsSL -H 'Accept: application/vnd.github+json' \
               'https://api.github.com/repos/rabbitmq/rabbitmq-server/releases?page=1&per_page=100')
 
             while IFS= read -r dockerfile; do
-              vdir="$(dirname "$(dirname "$dockerfile")")"   # 4.3/UOS -> 4.3
-              # 精准提取ARG RABBITMQ_VERSION，忽略注释、行尾空格
-              current="$(sed -nE 's/^ARG[[:space:]]+RABBITMQ_VERSION=([^ #]+).*/\1/p' "$dockerfile")"
+              vdir="$(dirname "$(dirname "$dockerfile")")"          # 4.3/UOS -> 4.3
+              variant="$(basename "$(dirname "$dockerfile")")"      # 4.3/UOS -> UOS
+              # 精准提取 ARG RABBITMQ_VERSION，忽略注释、行尾空格与 CRLF
+              current="$(sed -nE 's/^ARG[[:space:]]+RABBITMQ_VERSION=([^ #]+).*/\1/p' "$dockerfile" | tr -d '\r' | head -n1)"
               test -n "$current" || { echo "::warning::${dockerfile} 未找到 ARG RABBITMQ_VERSION，跳过"; continue; }
 
-              # jq 逻辑：
-              # 1.过滤非draft、非pre-release
-              # 2.tag_name 匹配 ^v${vdir}.数字，例如 v4.3.6
-              # 3.去掉v前缀，输出版本字符串
-              # 4.按语义化版本排序，取最大版本
+              # 过滤非 draft / 非 prerelease，tag 形如 v4.3.7，取语义化版本最大者
               latest=$(echo "$RELEASES" | jq -r --arg vdir "$vdir" '
                 [
                   .[]
@@ -124,22 +138,23 @@ jobs:
               ')
 
               if [ -z "$latest" ]; then
-                echo "::notice::${vdir}: 上游未发现匹配 v${vdir}.x 的正式版，跳过"
+                echo "::notice::${vdir}/${variant}: 上游未发现匹配 v${vdir}.x 的正式版，跳过"
                 continue
               fi
               if [ "$latest" != "$current" ]; then
-                echo "::notice::${vdir}: 上游有新版本 ${current} -> ${latest}"
-                # 精准替换ARG行，保留原有行格式，只替换版本号
+                echo "::notice::${vdir}/${variant}: 上游有新版本 ${current} -> ${latest}"
+                # 精准替换 ARG 行，保留原有行格式，只替换版本号
                 sed -i -E "s/^(ARG[[:space:]]+RABBITMQ_VERSION=).*/\1${latest}/" "$dockerfile"
-                matrix_entries_arr+=("{\"version\":\"${vdir}\",\"rabbitmq_version\":\"${latest}\"}")
+                matrix_entries_arr+=("{\"version\":\"${vdir}\",\"variant\":\"${variant}\",\"rabbitmq_version\":\"${latest}\"}")
                 should_commit="yes"
               else
-                echo "::notice::${vdir}: 已是上游最新正式版 ${current}，无需构建"
+                echo "::notice::${vdir}/${variant}: 已是上游最新正式版 ${current}，无需构建"
               fi
-            done < <(find . -mindepth 3 -maxdepth 3 -path './*/UOS/Dockerfile' | sed 's|^\./||' | sort)
+            done < <(find . -mindepth 3 -maxdepth 3 -name Dockerfile -path './*/*/Dockerfile' \
+                       | grep -Ev '/(alpine|ubuntu)/' | sed 's|^\./||' | sort)
           else
             ########################################
-            # 变更检测模式 (原有逻辑): 由本次提交涉及的文件决定
+            # 变更检测模式: 由本次提交涉及的文件决定
             ########################################
             files=""
             case "${{ github.event_name }}" in
@@ -152,25 +167,36 @@ jobs:
                 ;;
             esac
             # 取不到 diff (手动触发 / 新建分支首推 / 重跑) 时的兜底:
-            #   指定了 version_dir -> 只构建该版本; 否则构建仓库中全部 */UOS 变体
+            #   指定了 version_dir -> 只构建该版本 (可再指定 variant); 否则构建全部变体
             if [ -z "$files" ] && [ -n "${{ github.event.inputs.version_dir }}" ]; then
-              files="${{ github.event.inputs.version_dir }}/UOS/Dockerfile"
+              vd="${{ github.event.inputs.version_dir }}"
+              vi="${{ github.event.inputs.variant }}"
+              if [ -n "$vi" ]; then
+                files="${vd}/${vi}/Dockerfile"
+              else
+                for var in $variants; do
+                  files="${files}${vd}/${var}/Dockerfile"$'\n'
+                done
+              fi
             fi
             if [ -z "$files" ]; then
-              files=$(find . -mindepth 3 -maxdepth 3 -path './*/UOS/Dockerfile' | sed 's|^\./||')
+              files=$(find . -mindepth 3 -maxdepth 3 -name Dockerfile -path './*/*/Dockerfile' \
+                | grep -Ev '/(alpine|ubuntu)/' | sed 's|^\./||')
             fi
-            # 取路径首段 (版本目录名)，过滤掉 .github 等非版本目录
-            versions=$(printf '%s\n' "$files" | cut -d/ -f1 | grep -E '^[0-9]+(\.[0-9]+)*$' | sort -u || true)
-            # 仅保留实际存在 <版本>/UOS/Dockerfile 的目录 (防止 workflow_dispatch 手输错版本)
-            while IFS= read -r v; do
-              if [[ -n "${v}" && -f "${v}/UOS/Dockerfile" ]]; then
-                # 【同步修复】变更模式下ARG提取，和上游模式保持一致
-                cur="$(sed -nE 's/^ARG[[:space:]]+RABBITMQ_VERSION=([^ #]+).*/\1/p' "${v}/UOS/Dockerfile")"
-                test -n "$cur" || { echo "::warning::${v}/UOS/Dockerfile 缺少RABBITMQ_VERSION"; continue; }
-                matrix_entries_arr+=("{\"version\":\"${v}\",\"rabbitmq_version\":\"${cur}\"}")
-              fi
-            done < <(printf '%s\n' "${versions}")
+            # 解析出 (版本, 变体) 组合，过滤掉 .github 等非版本目录
+            pairs=$(printf '%s\n' "$files" | awk -F/ 'NF>=3 {print $1"/"$2}' | sort -u \
+              | grep -E '^[0-9]+(\.[0-9]+)*/[^/]+$' || true)
+            while IFS=/ read -r v var; do
+              [ -n "${v:-}" ] || continue
+              case "${var:-}" in alpine|ubuntu) continue ;; esac
+              # 仅保留实际存在的目录，防止 workflow_dispatch 手输错
+              [ -f "${v}/${var}/Dockerfile" ] || continue
+              cur="$(sed -nE 's/^ARG[[:space:]]+RABBITMQ_VERSION=([^ #]+).*/\1/p' "${v}/${var}/Dockerfile" | tr -d '\r' | head -n1)"
+              test -n "$cur" || { echo "::warning::${v}/${var}/Dockerfile 缺少 RABBITMQ_VERSION"; continue; }
+              matrix_entries_arr+=("{\"version\":\"${v}\",\"variant\":\"${var}\",\"rabbitmq_version\":\"${cur}\"}")
+            done < <(printf '%s\n' "$pairs")
           fi
+
           # 生成最终矩阵
           matrix="[$(IFS=,; echo "${matrix_entries_arr[*]}")]"
           # 提交 Dockerfile 版本升级，保持仓库与上游同步 (仅上游模式)
@@ -201,7 +227,7 @@ jobs:
   # 构建并推送镜像 (push 到 master / 手动触发 / 定时检测到上游新版本)
   ############################################
   build-push:
-    name: "推送镜像 (${{ matrix.version }}/UOS)"
+    name: "推送镜像 (${{ matrix.version }}/${{ matrix.variant }})"
     needs: [detect]
     if: >-
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
@@ -217,7 +243,7 @@ jobs:
       contents: read
       packages: write
     env:
-      BUILD_DIR: ${{ matrix.version }}/UOS
+      BUILD_DIR: ${{ matrix.version }}/${{ matrix.variant }}
     steps:
       - uses: actions/checkout@v4
       - name: 设置 QEMU (仅多架构时需要)
@@ -236,6 +262,7 @@ jobs:
         run: |
           set -eux
           VERSION_DIR="${{ matrix.version }}"
+          VARIANT="${{ matrix.variant }}"
           # 完整版本号来自 detect 矩阵:
           #   - 变更模式  = Dockerfile 中的 ARG RABBITMQ_VERSION
           #   - 上游模式  = 官方 releases 检测到的最新正式版
@@ -243,10 +270,15 @@ jobs:
           test -n "$FULL_VERSION"
           REPO="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
           IMAGE="${REGISTRY}/${REPO}"
-          # 镜像自带 rabbitmq_management 管理控制台插件，tag 统一带 -management 后缀
+          # 镜像自带 rabbitmq_management 管理控制台，tag 统一带 -management 后缀;
+          # UOS 保持既有命名 (无 OS 后缀)，其它变体追加 -<变体> 以区分
+          SUFFIX=""
+          if [ "$VARIANT" != "UOS" ]; then
+            SUFFIX="-${VARIANT}"
+          fi
           {
             echo "image=${IMAGE}"
-            echo "tags=${IMAGE}:${VERSION_DIR}-management,${IMAGE}:${FULL_VERSION}-management"
+            echo "tags=${IMAGE}:${VERSION_DIR}${SUFFIX}-management,${IMAGE}:${FULL_VERSION}${SUFFIX}-management"
           } >> "$GITHUB_OUTPUT"
       - name: 构建并推送
         uses: docker/build-push-action@v6
@@ -260,12 +292,12 @@ jobs:
           build-args: |
             RABBITMQ_VERSION=${{ matrix.rabbitmq_version }}
           tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=gha,scope=rabbitmq-${{ matrix.version }}-uos
-          cache-to: type=gha,scope=rabbitmq-${{ matrix.version }}-uos,mode=max
+          cache-from: type=gha,scope=rabbitmq-${{ matrix.version }}-${{ matrix.variant }}
+          cache-to: type=gha,scope=rabbitmq-${{ matrix.version }}-${{ matrix.variant }},mode=max
       - name: 汇总输出
         run: |
           {
-            echo "### 已推送镜像 (${{ matrix.version }}/UOS)"
+            echo "### 已推送镜像 (${{ matrix.version }}/${{ matrix.variant }})"
             echo '```'
             echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n'
             echo '```'
