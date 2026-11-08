@@ -176,11 +176,32 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 
 # 覆盖基础镜像 / 内网代理 / 强制 el 分支
 docker build --build-arg BASE_IMAGE_TAG=uos-server-20-1070a:v1.2 -t rabbitmq:4.3-management 4.3/UOS
+docker build --build-arg MIRROR_GITHUB=https://mirror.example.com -t rabbitmq:4.3-management 4.3/UOS
 docker build --build-arg MIRROR_GITHUB=https://mirror.example.com -t rabbitmq:4.3-kylin-management 4.3/kylin
+docker build --build-arg PGP_KEYSERVER=hkp://keyserver.internal:11371 -t rabbitmq:4.3-management 4.3/UOS
 docker build --build-arg ERLANG_RPM_EL=el8 -t rabbitmq:4.3-kylin-management 4.3/kylin
 ```
 
-### 5.2 批量构建
+### 5.2 可覆盖的构建参数
+
+两个变体都支持下列 ARG（`docker build --build-arg KEY=VALUE`）：
+
+| ARG | 默认值 | 说明 |
+|-----|--------|------|
+| `RABBITMQ_VERSION` | 见各 Dockerfile | RabbitMQ 版本，CI 会自动跟进上游 |
+| `OTP_VERSION` | 见各 Dockerfile | Erlang/OTP 版本 |
+| `MIRROR_GITHUB` | 空（直连 github.com） | 内网 GitHub 代理前缀，例如 `https://mirror.example.com` |
+| `PGP_KEYSERVER` | `hkps://keys.openpgp.org` | RabbitMQ `.asc` 验签的 keyserver |
+| `PGP_KEYSERVER_FALLBACK` | `keyserver.ubuntu.com` | 首选 keyserver 失败后的备用 |
+| `GOSU_VERSION` / `RABBITMQADMIN_VERSION` | `1.17` / `2.35.0` | 两个 GitHub 静态二进制版本 |
+| `BASE_IMAGE_TAG` | UOS：`uos-server-20-1070a:latest`<br>Kylin：`v11-2503` | 基础镜像 tag |
+| `BASE_IMAGE_REPO` | 仅 Kylin：`cr.kylinos.cn/kylin/kylin-server-minimal` | 基础镜像仓库 |
+| `ERLANG_RPM_EL` | 仅 Kylin：`auto` | `auto` 按 glibc 判定 el8/el9，可强制 `el8`/`el9` |
+
+> 所有 GitHub 下载都走同一个 `fetch()` 重试函数（5 次 + 退避 + HTML 错误页识别），
+> 失败时会打印具体的 URL 与尝试次数，便于区分「网络抖动」与「版本号写错」。
+
+### 5.3 批量构建
 
 ```bash
 ./build-images.sh                                        # 4.0~4.4 × UOS+kylin，linux/amd64，仅本地
@@ -193,7 +214,7 @@ PUSH=1 PLATFORMS=linux/amd64,linux/arm64 ./build-images.sh   # 多架构构建�
 可用环境变量：`IMAGE` / `VERSIONS` / `VARIANTS` / `PLATFORMS` / `PUSH` /
 `BASE_IMAGE_TAG` / `BASE_IMAGE_REPO` / `MIRROR_GITHUB` / `ERLANG_RPM_EL`。
 
-### 5.3 CI（GitHub Actions）
+### 5.4 CI（GitHub Actions）
 
 `.github/workflows/docker-build-rabbitmq-uos.yml` 自动扫描仓库内所有 `<版本>/<变体>/Dockerfile`
 （排除 `alpine` / `ubuntu`），变体列表由目录结构推导，新增变体无需改 workflow：
@@ -203,6 +224,12 @@ PUSH=1 PLATFORMS=linux/amd64,linux/arm64 ./build-images.sh   # 多架构构建�
 | push / PR 涉及 `*/UOS/**` 或 `*/kylin/**` | 只构建被改动的 `<版本>/<变体>` |
 | 手动触发 | 可指定 `version_dir`（如 `4.3`）与 `variant`（`UOS`/`kylin`），留空则全量 |
 | 每日定时 / 手动勾选 `check_upstream` | 检查上游 `v<目录>.x` 最新正式版；有新版则改写该版本**所有变体**的 `ARG RABBITMQ_VERSION`、提交回 master 并立即构建 |
+
+两个针对下载抖动的设置：
+
+- `strategy.max-parallel: 3`：10 个作业同时构建时，每个都要从 github.com 拉 erlang RPM（约 100MB）
+  与 RabbitMQ 发行包，高并发下载会被限流/连接重置，因此限制同时只跑 3 个。
+- **失败自动重试一次**：首次「构建并推送」失败时，会用同一份 GHA 缓存再跑一遍（只重跑失败层）。
 
 推送目标：
 
@@ -277,7 +304,10 @@ curl -s "https://api.github.com/repos/rabbitmq/erlang-rpm/releases/tags/v27.3.4.
 
 | 坑 | 说明 |
 |----|------|
+| **GitHub 下载抖动 / CI 并发过高** | 10 个作业并行时，每个都要从 github.com 拉 erlang RPM（约 100MB）与 RabbitMQ 发行包，会出现连接重置/限流，表现为某个 RUN 突然失败（`wget: exit 4`、`curl: (28)`），重跑又能过。现已三重兜底：Dockerfile 内 `fetch()` 5 次退避重试、CI `max-parallel: 3`、失败作业自动重试一次。 |
+| **keyserver 不可达** | `hkps://keys.openpgp.org` 在部分网络不可达时，会依次尝试 `PGP_KEYSERVER_FALLBACK`（默认 `keyserver.ubuntu.com`）；全部失败会明确报错，可用 `--build-arg PGP_KEYSERVER=<内网地址>` 指定。 |
 | **不要 COPY `20-management_agent.disable_metrics_collector.conf`** | 该文件会关闭 metrics collector，而管理 UI 的统计/图表依赖它。官方 `management` 变体是 build 后 `rm` 掉它；本镜像已合并 management，故直接不 COPY。若误加，管理界面统计会失效（`rabbitmq_prometheus` 仍可用）。 |
+| **RUN 续行里不能有空行** | Docker 会报 `Empty continuation line`。整行 `#` 注释在续行中是合法的（解析器会剥离），但空行不行。 |
 | 单个 RUN 内合并包管理器操作 | 每次 `yum`/`dnf5` 调用都会重下全部仓库元数据，拆成多个 RUN 会显著拉长构建时间 |
 | 用 `install <本地rpm>` 而非 `localinstall` | dnf5 没有 `localinstall`；本地 rpm 用 `install /path/x.rpm`，失败时回退 `rpm -ivh` |
 | erlang RPM 的 el 分支必须匹配 glibc | el9 要求 glibc ≥ 2.34。Kylin V11 = 2.38（el9）、Kylin V10 / UOS 20 = 2.28（el8），选错会在冒烟测试阶段报 crypto 启动失败 |

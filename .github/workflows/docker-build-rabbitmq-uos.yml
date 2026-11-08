@@ -237,6 +237,10 @@ jobs:
     timeout-minutes: 120
     strategy:
       fail-fast: false
+      # 同时最多 3 个构建作业: 每个作业都要从 github.com 拉 erlang RPM(~100MB) 与 RabbitMQ 发行包，
+      # 10 个作业并行时高并发下载会被限流/连接重置（表现为 wget/curl 网络类失败），
+      # 降低并发后成功率明显提升；配合 Dockerfile 内的 5 次退避重试兜底。
+      max-parallel: 3
       matrix:
         include: ${{ fromJson(needs.detect.outputs.matrix) }}
     permissions:
@@ -281,6 +285,9 @@ jobs:
             echo "tags=${IMAGE}:${VERSION_DIR}${SUFFIX}-management,${IMAGE}:${FULL_VERSION}${SUFFIX}-management"
           } >> "$GITHUB_OUTPUT"
       - name: 构建并推送
+        id: build
+        # 首次失败不立刻判死: 失败多为 GitHub 下载抖动，下面有一次完整重试
+        continue-on-error: true
         uses: docker/build-push-action@v6
         with:
           context: ${{ env.BUILD_DIR }}
@@ -292,6 +299,19 @@ jobs:
           build-args: |
             RABBITMQ_VERSION=${{ matrix.rabbitmq_version }}
           tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=rabbitmq-${{ matrix.version }}-${{ matrix.variant }}
+          cache-to: type=gha,scope=rabbitmq-${{ matrix.version }}-${{ matrix.variant }},mode=max
+      - name: 重试构建并推送 (首次失败时)
+        if: steps.build.outcome == 'failure'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.BUILD_DIR }}
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          build-args: |
+            RABBITMQ_VERSION=${{ matrix.rabbitmq_version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          # 复用首次已构建的层，只重跑失败的那一步及其之后
           cache-from: type=gha,scope=rabbitmq-${{ matrix.version }}-${{ matrix.variant }}
           cache-to: type=gha,scope=rabbitmq-${{ matrix.version }}-${{ matrix.variant }},mode=max
       - name: 汇总输出

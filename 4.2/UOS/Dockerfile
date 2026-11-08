@@ -44,6 +44,14 @@ ARG GOSU_VERSION=1.17
 ARG RABBITMQADMIN_VERSION=2.35.0
 ARG BASE_IMAGE_TAG=uos-server-20-1070a:latest
 
+# 下载源与验签相关（内网环境必须可覆盖）
+#   MIRROR_GITHUB          : 留空直连 github.com；内网可指向 GitHub 代理
+#   PGP_KEYSERVER          : 首选 keyserver（hkps 端口在内网常被拦截）
+#   PGP_KEYSERVER_FALLBACK : 首选失败后的备用 keyserver
+ARG MIRROR_GITHUB=""
+ARG PGP_KEYSERVER=hkps://keys.openpgp.org
+ARG PGP_KEYSERVER_FALLBACK=keyserver.ubuntu.com
+
 # erlang-rpm release 无 .asc 签名文件，使用官方 digest (GitHub API) 做 SHA256 校验
 # 升级 OTP_VERSION 时需同步更新以下两个摘要
 ARG ERLANG_RPM_SHA256_X86_64=d61548b5df3c60bf85e94be9677478e7154210787376801d5f4cedf05d2e0c05
@@ -61,11 +69,14 @@ ARG GOSU_VERSION
 ARG RABBITMQADMIN_VERSION
 ARG ERLANG_RPM_SHA256_X86_64
 ARG ERLANG_RPM_SHA256_AARCH64
+ARG MIRROR_GITHUB
+ARG PGP_KEYSERVER
+ARG PGP_KEYSERVER_FALLBACK
 
 LABEL maintainer="blueapple" \
         version="1.0" \
         description="RabbitMQ ${RABBITMQ_VERSION} (management) with Erlang/OTP ${OTP_VERSION} on UOS 1070a" \
-        org.opencontainers.image.source="https://github.com/blueapple168/rabbitmq" \
+        org.opencontainers.image.source="https://github.com/blueapple168/rabbitmq-docker" \
         org.opencontainers.image.base.name="registry.uniontech.com/uos-server-base/uos-server-20-1070a:latest" \
         org.opencontainers.image.title="RabbitMQ" \
         org.opencontainers.image.version="${RABBITMQ_VERSION}"
@@ -78,7 +89,8 @@ ENV LANG=C.UTF-8 LANGUAGE=C.UTF-8 LC_ALL=C.UTF-8
 
 # Erlang RPM 来源: RabbitMQ 官方团队维护的零依赖包 (自带 OpenSSL 运行时)
 # el8 对应 UOS Server 20 (RHEL 8 兼容, glibc 2.28)，无需源码编译 OpenSSL/Erlang
-ENV ERLANG_RPM_BASE_URL=https://github.com/rabbitmq/erlang-rpm/releases/download/v${OTP_VERSION}
+# 仅记录仓库内路径，主机部分由 RUN 内的 MIRROR_GITHUB 决定
+ENV ERLANG_RPM_PATH=rabbitmq/erlang-rpm/releases/download/v${OTP_VERSION}
 ENV ERLANG_RPM_VERSION=${OTP_VERSION}
 
 # yum 相关操作 (调优/makecache/装依赖/装 erlang RPM) 合并在单个 RUN 中:
@@ -105,6 +117,24 @@ RUN set -eux; \
         --setopt=timeout=300 --setopt=minrate=100 \
         ca-certificates tar tzdata xz wget curl procps gnupg2 findutils hostname; \
     \
+    : "=== 下载重试函数: 5 次 + 退避 + HTML 错误页识别 (GitHub 高并发下载易被限流/连接重置) ===" ; \
+    fetch() { \
+        _u="$1"; _o="$2"; _n=0; \
+        while [ "$_n" -lt 5 ]; do \
+            if curl -fsSL --connect-timeout 20 --retry 2 --retry-delay 5 -o "$_o" "$_u"; then \
+                head -c 1024 "$_o" > /tmp/.fetch.probe 2>/dev/null || true; \
+                if grep -qi -m1 -e '<!doctype' -e '<html' /tmp/.fetch.probe 2>/dev/null; then \
+                    echo "WARN: ${_u} 返回 HTML 错误页，重试" >&2; rm -f "$_o" /tmp/.fetch.probe; \
+                else \
+                    rm -f /tmp/.fetch.probe; return 0; \
+                fi; \
+            fi; \
+            _n=$((_n + 1)); echo "WARN: 下载失败 (第 ${_n}/5 次): ${_u}" >&2; sleep $((_n * 5)); \
+        done; \
+        echo "ERROR: 下载重试 5 次仍失败: ${_u}" >&2; return 1; \
+    }; \
+    GH="${MIRROR_GITHUB:-https://github.com}"; \
+    \
     : "=== 下载 erlang-rpm 并按架构映射官方 SHA256 (x86_64/aarch64 对应 el8 资产) ===" ; \
     case "$(uname -m)" in \
         x86_64)  rpmArch='x86_64';   rpmSha="${ERLANG_RPM_SHA256_X86_64}" ;; \
@@ -112,9 +142,9 @@ RUN set -eux; \
         *) echo >&2 "error: unsupported arch: '$(uname -m)'"; exit 1 ;; \
     esac; \
     ERLANG_RPM="erlang-${ERLANG_RPM_VERSION}-1.el8.${rpmArch}.rpm"; \
-    ERLANG_RPM_URL="${ERLANG_RPM_BASE_URL}/${ERLANG_RPM}"; \
+    ERLANG_RPM_URL="${GH}/${ERLANG_RPM_PATH}/${ERLANG_RPM}"; \
     \
-    wget --progress dot:giga --output-document "/tmp/${ERLANG_RPM}" "$ERLANG_RPM_URL"; \
+    fetch "$ERLANG_RPM_URL" "/tmp/${ERLANG_RPM}"; \
     \
     : "=== SHA256 校验: 摘要来自 rabbitmq/erlang-rpm release 官方元数据 (无 .asc 资产，这是官方提供的唯一校验手段) ===" ; \
     echo "${rpmSha}  /tmp/${ERLANG_RPM}" | sha256sum --check --strict -; \
@@ -168,8 +198,32 @@ RUN set -eux; \
         aarch64) gosuArch='arm64' ;; \
         *) echo >&2 "error: unsupported arch: '$(uname -m)'"; exit 1 ;; \
     esac; \
-    wget --progress dot:giga --output-document /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/${GOSU_VERSION}/gosu-${gosuArch}"; \
-    chmod +x /usr/local/bin/gosu; \
+    : "=== 下载重试函数: 5 次 + 退避 + HTML 错误页识别 (GitHub 高并发下载易被限流/连接重置) ===" ; \
+    fetch() { \
+        _u="$1"; _o="$2"; _n=0; \
+        while [ "$_n" -lt 5 ]; do \
+            if curl -fsSL --connect-timeout 20 --retry 2 --retry-delay 5 -o "$_o" "$_u"; then \
+                head -c 1024 "$_o" > /tmp/.fetch.probe 2>/dev/null || true; \
+                if grep -qi -m1 -e '<!doctype' -e '<html' /tmp/.fetch.probe 2>/dev/null; then \
+                    echo "WARN: ${_u} 返回 HTML 错误页，重试" >&2; rm -f "$_o" /tmp/.fetch.probe; \
+                else \
+                    rm -f /tmp/.fetch.probe; return 0; \
+                fi; \
+            fi; \
+            _n=$((_n + 1)); echo "WARN: 下载失败 (第 ${_n}/5 次): ${_u}" >&2; sleep $((_n * 5)); \
+        done; \
+        echo "ERROR: 下载重试 5 次仍失败: ${_u}" >&2; return 1; \
+    }; \
+    GH="${MIRROR_GITHUB:-https://github.com}"; \
+    \
+    : "=== 下载 gosu 与官方 SHA256SUMS 并校验 ===" ; \
+    fetch "${GH}/tianon/gosu/releases/download/${GOSU_VERSION}/SHA256SUMS" /tmp/gosu.sums; \
+    fetch "${GH}/tianon/gosu/releases/download/${GOSU_VERSION}/gosu-${gosuArch}" "/tmp/gosu-${gosuArch}"; \
+    cd /tmp; \
+    grep " \*\?gosu-${gosuArch}\$" gosu.sums | sha256sum -c -; \
+    install -m 0755 "/tmp/gosu-${gosuArch}" /usr/local/bin/gosu; \
+    rm -f /tmp/gosu.sums "/tmp/gosu-${gosuArch}"; \
+    cd /; \
     \
     : "=== 验证 gosu 可用 ===" ; \
     gosu nobody true;
@@ -187,16 +241,42 @@ ENV RABBITMQ_HOME=/opt/rabbitmq
 ENV PATH=$RABBITMQ_HOME/sbin:$PATH
 
 RUN set -eux; \
-    RABBITMQ_SOURCE_URL="https://github.com/rabbitmq/rabbitmq-server/releases/download/v$RABBITMQ_VERSION/rabbitmq-server-generic-unix-$RABBITMQ_VERSION.tar.xz"; \
+    : "=== 下载重试函数: 5 次 + 退避 + HTML 错误页识别 (GitHub 高并发下载易被限流/连接重置) ===" ; \
+    fetch() { \
+        _u="$1"; _o="$2"; _n=0; \
+        while [ "$_n" -lt 5 ]; do \
+            if curl -fsSL --connect-timeout 20 --retry 2 --retry-delay 5 -o "$_o" "$_u"; then \
+                head -c 1024 "$_o" > /tmp/.fetch.probe 2>/dev/null || true; \
+                if grep -qi -m1 -e '<!doctype' -e '<html' /tmp/.fetch.probe 2>/dev/null; then \
+                    echo "WARN: ${_u} 返回 HTML 错误页，重试" >&2; rm -f "$_o" /tmp/.fetch.probe; \
+                else \
+                    rm -f /tmp/.fetch.probe; return 0; \
+                fi; \
+            fi; \
+            _n=$((_n + 1)); echo "WARN: 下载失败 (第 ${_n}/5 次): ${_u}" >&2; sleep $((_n * 5)); \
+        done; \
+        echo "ERROR: 下载重试 5 次仍失败: ${_u}" >&2; return 1; \
+    }; \
+    GH="${MIRROR_GITHUB:-https://github.com}"; \
+    RABBITMQ_SOURCE_URL="${GH}/rabbitmq/rabbitmq-server/releases/download/v$RABBITMQ_VERSION/rabbitmq-server-generic-unix-$RABBITMQ_VERSION.tar.xz"; \
     RABBITMQ_PATH="/usr/local/src/rabbitmq-$RABBITMQ_VERSION"; \
     \
     : "=== 下载 tar.xz 与官方 .asc PGP 签名文件 ===" ; \
-    wget --progress dot:giga --output-document "$RABBITMQ_PATH.tar.xz" "$RABBITMQ_SOURCE_URL"; \
-    wget --progress dot:giga --output-document "$RABBITMQ_PATH.tar.xz.asc" "$RABBITMQ_SOURCE_URL.asc"; \
+    fetch "$RABBITMQ_SOURCE_URL" "$RABBITMQ_PATH.tar.xz"; \
+    fetch "$RABBITMQ_SOURCE_URL.asc" "$RABBITMQ_PATH.tar.xz.asc"; \
     \
     : "=== PGP 签名校验: 导入 RabbitMQ 官方签名密钥并验证 tar.xz (与官方 alpine/ubuntu Dockerfile 一致) ===" ; \
     export GNUPGHOME="$(mktemp -d)"; \
-    gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys "$RABBITMQ_PGP_KEY_ID"; \
+    imported=''; \
+    for ks in "$PGP_KEYSERVER" "$PGP_KEYSERVER_FALLBACK"; do \
+        [ -n "$ks" ] || continue; \
+        _n=0; \
+        while [ "$_n" -lt 3 ]; do \
+            if gpg --batch --keyserver "$ks" --recv-keys "$RABBITMQ_PGP_KEY_ID"; then imported=1; break 2; fi; \
+            _n=$((_n + 1)); echo "WARN: keyserver ${ks} 导入失败 (第 ${_n}/3 次)" >&2; sleep $((_n * 5)); \
+        done; \
+    done; \
+    [ "$imported" = 1 ] || { echo "ERROR: 所有 keyserver 均无法导入 RabbitMQ 签名密钥；内网可用 --build-arg PGP_KEYSERVER=<地址> 指定" >&2; exit 1; }; \
     gpg --batch --verify "$RABBITMQ_PATH.tar.xz.asc" "$RABBITMQ_PATH.tar.xz"; \
     gpgconf --kill all; \
     rm -rf "$GNUPGHOME"; \
@@ -254,9 +334,26 @@ RUN set -eux; \
         aarch64) adminArch='aarch64-unknown-linux-musl' ;; \
         *) echo >&2 "[INFO] rabbitmqadmin is not available on $(uname -m) (yet?)"; exit 0 ;; \
     esac; \
+    : "=== 下载重试函数: 5 次 + 退避 + HTML 错误页识别 (GitHub 高并发下载易被限流/连接重置) ===" ; \
+    fetch() { \
+        _u="$1"; _o="$2"; _n=0; \
+        while [ "$_n" -lt 5 ]; do \
+            if curl -fsSL --connect-timeout 20 --retry 2 --retry-delay 5 -o "$_o" "$_u"; then \
+                head -c 1024 "$_o" > /tmp/.fetch.probe 2>/dev/null || true; \
+                if grep -qi -m1 -e '<!doctype' -e '<html' /tmp/.fetch.probe 2>/dev/null; then \
+                    echo "WARN: ${_u} 返回 HTML 错误页，重试" >&2; rm -f "$_o" /tmp/.fetch.probe; \
+                else \
+                    rm -f /tmp/.fetch.probe; return 0; \
+                fi; \
+            fi; \
+            _n=$((_n + 1)); echo "WARN: 下载失败 (第 ${_n}/5 次): ${_u}" >&2; sleep $((_n * 5)); \
+        done; \
+        echo "ERROR: 下载重试 5 次仍失败: ${_u}" >&2; return 1; \
+    }; \
+    GH="${MIRROR_GITHUB:-https://github.com}"; \
     \
-    wget --progress dot:giga --output-document /usr/local/bin/rabbitmqadmin \
-        "https://github.com/rabbitmq/rabbitmqadmin-ng/releases/download/v${RABBITMQADMIN_VERSION}/rabbitmqadmin-${RABBITMQADMIN_VERSION}-${adminArch}"; \
+    fetch "${GH}/rabbitmq/rabbitmqadmin-ng/releases/download/v${RABBITMQADMIN_VERSION}/rabbitmqadmin-${RABBITMQADMIN_VERSION}-${adminArch}" \
+        /usr/local/bin/rabbitmqadmin; \
     chmod +x /usr/local/bin/rabbitmqadmin; \
     \
     : "=== 验证 rabbitmqadmin 可用 ===" ; \
