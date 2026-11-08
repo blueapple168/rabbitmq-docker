@@ -181,15 +181,17 @@ RUN set -euxo pipefail; \
     ERLANG_RPM="erlang-${OTP_VERSION}-1.${EL_TAG}.${rpmArch}.rpm"; \
     ERLANG_RPM_URL="${GH}/rabbitmq/erlang-rpm/releases/download/v${OTP_VERSION}/${ERLANG_RPM}"; \
     echo "Downloading: ${ERLANG_RPM_URL}"; \
-    fetch "$ERLANG_RPM_URL" "/tmp/${ERLANG_RPM}"; \
-    echo "${rpmSha}  /tmp/${ERLANG_RPM}" | sha256sum --check --strict -; \
+    # 每步用独立退出码，注解里能看到 exit code 直接定位（GitHub 注解不含输出）:
+    #   12=下载失败 13=SHA256 不符 14=无包管理器 15=安装失败 16=无 erl 17=crypto 冒烟失败
+    fetch "$ERLANG_RPM_URL" "/tmp/${ERLANG_RPM}" || exit 12; \
+    echo "${rpmSha}  /tmp/${ERLANG_RPM}" | sha256sum --check --strict - || exit 13; \
     PKG_MGR="$(command -v dnf5 || command -v dnf || command -v microdnf || command -v yum || true)"; \
-    if [ -z "$PKG_MGR" ]; then echo "ERROR: 未找到包管理器" >&2; exit 1; fi; \
-    "$PKG_MGR" install -y --setopt=install_weak_deps=False "/tmp/${ERLANG_RPM}" \
-        || rpm -ivh --replacepkgs "/tmp/${ERLANG_RPM}"; \
+    if [ -z "$PKG_MGR" ]; then echo "ERROR: 未找到包管理器" >&2; exit 14; fi; \
+    { "$PKG_MGR" install -y --setopt=install_weak_deps=False "/tmp/${ERLANG_RPM}" \
+        || rpm -ivh --replacepkgs "/tmp/${ERLANG_RPM}"; } || exit 15; \
     rm -f "/tmp/${ERLANG_RPM}"; \
-    command -v erl; \
-    erl -noshell -eval 'case crypto:start() of ok -> io:format("crypto started ok~n"); {error,E} -> io:format("crypto start ERROR ~p~n",[E]), halt(1) end, init:stop().'
+    command -v erl || exit 16; \
+    erl -noshell -eval 'case crypto:start() of ok -> io:format("crypto started ok~n"); {error,E} -> io:format("crypto start ERROR ~p~n",[E]), halt(1) end, init:stop().' || exit 17
 
 ############################################
 # RUN#3 gosu（GitHub 静态二进制 + SHA256SUMS 校验）与最终清理
